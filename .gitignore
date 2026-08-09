@@ -1,0 +1,4 @@
+.vscode
+# local working files
+*.bak
+logs/
