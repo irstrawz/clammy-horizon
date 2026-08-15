@@ -1567,14 +1567,29 @@ func.renderClammy = function(clammy)
 		imgui.SameLine();
 		imgui.SetCursorPosX(imgui.GetCursorPosX() + imgui.GetColumnWidth() - imgui.GetStyle().FramePadding.x - imgui.CalcTextSize("[999]"));
 		local cdTime = math.floor(clammy.cooldown - os.clock());
-		if (Config.useStopTone[1] == true and (clammy.stopSound == true or clammy.bucketIsBroke == true)) then
-			cdTime = cdTime - 9;
-		end
+
+		-- The stop tone is meant to fire nine seconds early, so there is time
+		-- to react before the dig comes off cooldown. That subtraction used
+		-- to be applied to the countdown itself, which made the timer look
+		-- broken on a heavy bucket: it showed 1 and jumped straight to ready.
+		-- Only the sound is early now; the number is the real cooldown.
+		local warnEarly = (Config.useStopTone[1] == true)
+			and ((clammy.stopSound == true) or (clammy.bucketIsBroke == true));
+
 		if (cdTime <= 0) then
 			imgui.TextColored({ 0.5, 1.0, 0.5, 1.0 }, "  [*]");
 			clammy = playSound(clammy);
 		else
-			imgui.TextColored({ 1.0, 1.0, 0.5, 1.0 }, "  [" .. cdTime .. "]");
+			if (warnEarly == true) and (cdTime <= 9) then
+				clammy = playSound(clammy);
+			end
+			-- Red while the addon wants the bucket turned in, so the warning
+			-- is still visible and not only audible.
+			local cdColor = { 1.0, 1.0, 0.5, 1.0 };
+			if (clammy.bucketShouldBeTurnedIn == true) or (clammy.bucketIsBroke == true) then
+				cdColor = { 1.0, 0.4, 0.3, 1.0 };
+			end
+			imgui.TextColored(cdColor, "  [" .. cdTime .. "]");
 		end
 		if (Config.showValue[1] == true) then
 			imgui.Text("Estimated Value: " .. formatInt(clammy.money));
