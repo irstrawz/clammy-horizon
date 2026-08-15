@@ -2,3 +2,4 @@
 # local working files
 *.bak
 logs/
+session.lua

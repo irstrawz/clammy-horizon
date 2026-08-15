@@ -5,6 +5,229 @@ local imgui = require('imgui');
 local func = T{};
 local colorConverter = imgui.ColorConvertU32ToFloat4;
 
+----------------------------------------------------------------------
+-- Session persistence
+--
+-- The whole session lives in memory, so a disconnect or client crash
+-- used to lose the current bucket entirely. It is mirrored to a small
+-- Lua file every few seconds and restored on load.
+--
+-- Note that os.clock() restarts with the process, so no raw clock value
+-- is ever written out. Durations are stored instead, and rebuilt against
+-- the wall clock on the way back in.
+----------------------------------------------------------------------
+local statePath     = ('%s\\addons\\Clammy\\session.lua'):fmt(AshitaCore:GetInstallPath());
+local lastStateSave = 0;
+
+local PERSISTED = T{
+	'bucketSize', 'relativeWeight', 'percentRemaining', 'weight', 'money',
+	'sessionValue', 'sessionValueNPC', 'sessionValueAH',
+	'bucketsPurchased', 'bucketsReceived',
+	'bucketAverageTime', 'bucketTimeWith',
+	'hasBucket', 'bucketIsBroke', 'bucketShouldBeTurnedIn', 'kitFallback',
+	'fileName', 'fileNameBroken',
+};
+
+local function serialize(value, indent)
+	indent = indent or '';
+	local kind = type(value);
+	if (kind == 'number') or (kind == 'boolean') then
+		return tostring(value);
+	elseif (kind == 'string') then
+		return string.format('%q', value);
+	elseif (kind == 'table') then
+		local parts = { '{' };
+		for k, v in pairs(value) do
+			local key;
+			if (type(k) == 'number') then
+				key = ('[%d]'):fmt(k);
+			else
+				key = string.format('[%q]', tostring(k));
+			end
+			parts[#parts + 1] = ('%s  %s = %s,'):fmt(indent, key, serialize(v, indent .. '  '));
+		end
+		parts[#parts + 1] = indent .. '}';
+		return table.concat(parts, '\n');
+	end
+	return 'nil';
+end
+
+func.saveState = function(clammy, force)
+	local now = os.clock();
+	if (force ~= true) and ((now - lastStateSave) < 10) then
+		return clammy;
+	end
+	lastStateSave = now;
+
+	-- Nothing worth keeping.
+	if (clammy.hasBucket ~= true) and (clammy.weight == 0)
+		and (clammy.sessionValue == 0) and (clammy.clammingAttempts == 0) then
+		return clammy;
+	end
+
+	local state = {
+		version           = 1,
+		savedAt           = os.time(),
+		sessionElapsed    = now - clammy.startingTime,
+		lastActionElapsed = now - clammy.lastClammingAction,
+		bucketElapsed     = (clammy.bucketStartTime > 0) and (now - clammy.bucketStartTime) or 0,
+		bucket            = clammy.bucket,
+		trackingBucket    = clammy.trackingBucket,
+	};
+	for _, key in ipairs(PERSISTED) do
+		state[key] = clammy[key];
+	end
+
+	local file = io.open(statePath, 'w');
+	if (file == nil) then
+		return clammy;
+	end
+	file:write('return ' .. serialize(state));
+	io.close(file);
+	return clammy;
+end
+
+func.clearState = function()
+	pcall(os.remove, statePath);
+end
+
+-- Everything back to a clean slate: bucket, session totals, timers, logs
+-- and the saved state file. The kit flag is deliberately left alone, so a
+-- bucket still in hand is picked straight back up and counted as the
+-- first of the new session.
+func.fullReset = function(clammy)
+	clammy = func.emptyBucket(clammy, false, true);
+
+	clammy.sessionValue            = 0;
+	clammy.sessionValueNPC         = 0;
+	clammy.sessionValueAH          = 0;
+	clammy.trueSessionValue        = 0;
+	clammy.trueSessionValueNPC     = 0;
+	clammy.trueSessionValueAH      = 0;
+	clammy.bucketsPurchased        = 0;
+	clammy.bucketsReceived         = 0;
+	clammy.clammingAttempts        = 0;
+	clammy.clammingAttemptsPerHour = 0;
+	clammy.bucketAverageTime       = 0;
+	clammy.bucketTimeWith          = 0;
+	clammy.gilPerHour              = 0;
+	clammy.gilPerHourNPC           = 0;
+	clammy.gilPerHourAH            = 0;
+	clammy.gilPerHourMinusBucket   = 0;
+	clammy.trackingBucket          = {};
+	clammy.bucketIsBroke           = false;
+	clammy.bucketShouldBeTurnedIn  = false;
+	clammy.sessionWasReset         = false;
+	clammy.pendingBreak            = false;
+	clammy.pendingTurnIn           = false;
+	clammy.cooldown                = 0;
+
+	local now = os.clock();
+	clammy.startingTime       = now;
+	clammy.lastClammingAction = now;
+	clammy.bucketStartTime    = 0;
+
+	clammy.fileName       = ('log_%s.txt'):fmt(os.date('%Y_%m_%d__%H_%M_%S'));
+	clammy.fileNameBroken = ('log_broken_%s.txt'):fmt(os.date('%Y_%m_%d__%H_%M_%S'));
+	clammy.filePath       = clammy.fileDir .. clammy.fileName;
+	clammy.filePathBroken = clammy.fileDir .. clammy.fileNameBroken;
+
+	func.clearState();
+	return clammy;
+end
+
+----------------------------------------------------------------------
+-- Purgonorgo Isle detection
+--
+-- The isle is not its own zone: it sits inside Bibiki Bay (zone 4), so
+-- no zone id can distinguish the two and position has to be used.
+--
+-- The centre below is the midpoint of two samples taken at either end of
+-- the clamming beach, which sit 66 units out. The Manaclipper dock on the
+-- mainland is 1420 units from that centre, so the radius has roughly a
+-- thousand units of slack in both directions.
+--
+-- Note that Ashita's second position component is height; the horizontal
+-- plane is X and Y.
+----------------------------------------------------------------------
+local CLAM_ZONE   = 4;
+local ISLE_X      = -357.7;
+local ISLE_Y      = -419.1;
+local ISLE_RADIUS = 500.0;
+
+local function onPurgonorgoIsle()
+	local party = AshitaCore:GetMemoryManager():GetParty();
+	if (party:GetMemberZone(0) ~= CLAM_ZONE) then
+		return false;
+	end
+
+	local inside = false;
+	pcall(function ()
+		local entity = AshitaCore:GetMemoryManager():GetEntity();
+		local index  = party:GetMemberTargetIndex(0);
+		local dx = entity:GetLocalPositionX(index) - ISLE_X;
+		local dy = entity:GetLocalPositionY(index) - ISLE_Y;
+		inside = ((dx * dx) + (dy * dy)) <= (ISLE_RADIUS * ISLE_RADIUS);
+	end);
+	return inside;
+end
+
+func.restoreState = function(clammy)
+	local chunk = loadfile(statePath);
+	if (chunk == nil) then
+		return clammy, false, 0;
+	end
+
+	local ok, state = pcall(chunk);
+	if (not ok) or (type(state) ~= 'table') or (state.version ~= 1) then
+		return clammy, false, 0;
+	end
+
+	-- Anything older than the auto-reset window is a new session, not a
+	-- disconnect, so it is left alone.
+	local away  = os.time() - (state.savedAt or 0);
+	local limit = ((Config.minutesBeforeAutoReset[1] or 120) * 60);
+	if (away < 0) or (away > limit) then
+		return clammy, false, 0;
+	end
+
+	for _, key in ipairs(PERSISTED) do
+		if (state[key] ~= nil) then
+			clammy[key] = state[key];
+		end
+	end
+	if (type(state.bucket) == 'table') then
+		clammy.bucket = state.bucket;
+	end
+	if (type(state.trackingBucket) == 'table') then
+		clammy.trackingBucket = state.trackingBucket;
+	end
+
+	local now = os.clock();
+
+	-- Session length and dig count deliberately start fresh. They describe
+	-- the current play session rather than the bucket, and dig rate stays
+	-- consistent because both halves of it reset together.
+	clammy.startingTime            = now;
+	clammy.clammingAttempts        = 0;
+	clammy.clammingAttemptsPerHour = 0;
+
+	clammy.lastClammingAction = now - ((state.lastActionElapsed or 0) + away);
+	if ((state.bucketElapsed or 0) > 0) then
+		clammy.bucketStartTime = now - (state.bucketElapsed + away);
+	else
+		clammy.bucketStartTime = 0;
+	end
+	-- The dig cooldown is meaningless after any gap.
+	clammy.cooldown = now;
+
+	-- Keep writing to the same log files the session started with.
+	clammy.filePath       = clammy.fileDir .. clammy.fileName;
+	clammy.filePathBroken = clammy.fileDir .. clammy.fileNameBroken;
+
+	return clammy, true, away;
+end
+
 local openLogFile = function(clammy, notBroken)
 	if (ashita.fs.create_directory(clammy.fileDir) ~= false) then
         local file;
@@ -983,6 +1206,13 @@ func.handleChatCommands = function(args, clammy)
         return clammy;
 	end
 
+	if (#args == 2 and args[2]:any('resetall', 'full')) then
+		clammy = func.fullReset(clammy);
+		print(chat.header(addon.name):append(chat.message(
+			'Full refresh: bucket, session totals, timers and saved state cleared.')));
+		return clammy;
+	end
+
     if (#args == 2 and args[2]:any('reset')) then --manually empty the bucket
 		clammy = func.emptyBucket(clammy, false, true);
 		print(chat.header(addon.name):append(chat.message('Bucket reset.')));
@@ -1009,6 +1239,31 @@ func.handleChatCommands = function(args, clammy)
 		print(chat.header(addon.name):append(chat.message(('Weight manually set to %s.'):fmt(clammy.weight))));
         return clammy;
     end
+
+	if (#args == 2 and args[2]:any('zone')) then
+		local party  = AshitaCore:GetMemoryManager():GetParty();
+		local zoneId = party:GetMemberZone(0);
+
+		local x, y, z = 0, 0, 0;
+		pcall(function ()
+			local entity = AshitaCore:GetMemoryManager():GetEntity();
+			local index  = party:GetMemberTargetIndex(0);
+			x = entity:GetLocalPositionX(index);
+			y = entity:GetLocalPositionY(index);
+			z = entity:GetLocalPositionZ(index);
+		end);
+
+		local dx, dy = x - ISLE_X, y - ISLE_Y;
+		local away   = math.sqrt((dx * dx) + (dy * dy));
+
+		print(chat.header(addon.name):append(chat.message(
+			('zone %d   x %.1f   y %.1f   height %.1f'):fmt(zoneId, x, y, z))));
+		print(chat.header(addon.name):append(chat.message(
+			('%.0f units from the isle centre (limit %.0f) -> %s'):fmt(
+				away, ISLE_RADIUS,
+				onPurgonorgoIsle() and 'on Purgonorgo Isle' or 'elsewhere, addon hidden'))));
+		return clammy;
+	end
 
 	if (args[2]:any('debug')) then
 		if (args[3] == nil) then
@@ -1096,7 +1351,6 @@ end
 func.handleTextIn = function(e, clammy)
 
 	local hasBucketKI = hasClammingKit(clammy);
-	local areaId = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
 	local lowerMessage = string.lower(e.message);
 
 	-- Kit state is tracked ahead of the zone gate. Obtaining, returning and
@@ -1127,7 +1381,7 @@ func.handleTextIn = function(e, clammy)
 		clammy.kitFallback  = false;
 	end
 
-	if (areaId ~= 4) then
+	if (onPurgonorgoIsle() == false) then
 		return clammy;
 	end
 
@@ -1261,8 +1515,8 @@ end
 func.renderClammy = function(clammy)
 	-- handling if player is nil zoning
 	local player = GetPlayerEntity();
-	local areaId = AshitaCore:GetMemoryManager():GetParty():GetMemberZone(0);
-	if ((areaId ~= 4) and (Config.hideInDifferentZone[1] == true)) then -- when zoning or outside Bibiki Bay
+	-- Hidden anywhere but the clamming beach on Purgonorgo Isle.
+	if ((onPurgonorgoIsle() == false) and (Config.hideInDifferentZone[1] == true)) then
 		return clammy;
 	end
 	if (player ~= nil) then

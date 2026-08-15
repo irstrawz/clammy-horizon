@@ -26,6 +26,7 @@ addon.desc     = 'Clamming calculator: displays bucket weight, items in bucket, 
 addon.version  = '1.2.1-hzfix';
 
 require('common');
+local chat = require('chat');
 local const = require('constants');
 local func = require('functions');
 Settings = require('settings');
@@ -127,11 +128,19 @@ clammy.filePathBroken = clammy.fileDir .. clammy.fileNameBroken;
 ashita.events.register('load', 'load_cb', function()
 	clammy = func.emptyBucket(clammy, true, true);
 
+	-- Pick the session back up after a disconnect or a crash.
+	local restored, away = false, 0;
+	clammy, restored, away = func.restoreState(clammy);
+	if (restored == true) then
+		print(chat.header(addon.name):append(chat.message(
+			('Bucket restored after %d min: %d ponzes, %d bucket(s). Session timer and digs reset.'):fmt(
+				math.floor(away / 60), clammy.weight, clammy.bucketsReceived))));
+	end
 end);
 
 --------------------------------------------------------------------
 ashita.events.register('unload', 'unload_cb', function()
-
+	func.saveState(clammy, true);
 end);
 
 --------------------------------------------------------------------
@@ -171,4 +180,8 @@ ashita.events.register('d3d_present', 'present_cb', function ()
 	end
 
 	clammy = func.renderClammy(clammy);
+
+	-- Throttled internally; mirrors the session to disk every 10 seconds so
+	-- a crash costs at most that much progress.
+	clammy = func.saveState(clammy);
 end);
